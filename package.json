@@ -1,0 +1,31 @@
+{
+  "name": "obsidian-affine-sync",
+  "version": "0.1.0",
+  "description": "One-way sync of an Obsidian/Markdown vault into a self-hosted AFFiNE workspace, with wikilink resolution and frontmatter mapping.",
+  "bin": {
+    "affine-sync": "affine-sync.js"
+  },
+  "type": "commonjs",
+  "engines": {
+    "node": ">=18"
+  },
+  "scripts": {
+    "sync": "node affine-sync.js"
+  },
+  "keywords": [
+    "affine",
+    "obsidian",
+    "markdown",
+    "sync",
+    "mcp",
+    "notes",
+    "wikilinks",
+    "frontmatter"
+  ],
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/julianfleck/obsidian-affine-sync.git"
+  },
+  "author": "Julian Fleck",
+  "license": "Apache-2.0"
+}

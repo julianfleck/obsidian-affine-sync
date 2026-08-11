@@ -1,0 +1,5 @@
+node_modules/
+# per-vault sync state — belongs next to the vault, not in this repo
+.affine-sync.json
+*.log
+.DS_Store

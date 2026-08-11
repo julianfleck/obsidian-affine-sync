@@ -1,6 +1,6 @@
 {
   "name": "obsidian-affine-sync",
-  "version": "0.5.0",
+  "version": "0.6.0",
   "description": "One-way sync of an Obsidian/Markdown vault into a self-hosted AFFiNE workspace, with wikilink resolution, frontmatter mapping, folder mirroring, and gitignore-style excludes.",
   "bin": {
     "affine-sync": "affine-sync.js"

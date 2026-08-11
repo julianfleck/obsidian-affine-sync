@@ -1,12 +1,13 @@
 #!/usr/bin/env node
 // affine-sync — one-way sync of a Markdown vault into an AFFiNE workspace.
 //   AFFINE_BASE_URL=https://affine.example.com AFFINE_EMAIL=you@example.com AFFINE_PASSWORD=... \
-//     node affine-sync.js <workspaceId> <vaultDir> [--sidecar <path>] [--dry-run] [--no-folders] [--exclude <glob>]
-// Excludes: <vault>/.affineignore (gitignore syntax) and/or --exclude. Identity via a sidecar JSON.
-// Converts [[wikilinks]] -> form-A links; frontmatter tags -> AFFiNE tags; SCALAR frontmatter -> custom
-// properties (text/number/checkbox/date); icon -> doc icon; title -> title. List-valued frontmatter keys
-// (attendees, topics, ...) are NOT mapped to properties. Subfolders mirror as AFFiNE sidebar folders
-// (progressively). Markdown import is non-strict (imperfect blocks -> warnings, not a whole-doc abort).
+//     node affine-sync.js <workspaceId> <vaultDir> [--sidecar <path>] [--dry-run] [--no-folders]
+//                         [--exclude <glob>] [--exclude-content <substring>]
+// Excludes: <vault>/.affineignore (gitignore syntax for PATHS; a line `content:<substring>` skips files
+// whose text contains that substring — e.g. auto-generated index files). --exclude / --exclude-content
+// add ad-hoc path/content filters. Identity via a sidecar JSON. Converts [[wikilinks]] -> form-A links;
+// frontmatter tags -> AFFiNE tags; SCALAR frontmatter -> custom properties; icon/title mapped; list-valued
+// frontmatter keys are NOT mapped. Subfolders mirror as sidebar folders (progressively). Import is non-strict.
 const { spawn } = require('child_process');
 const fs = require('fs'); const path = require('path'); const crypto = require('crypto');
 const ENVV = process["e"+"nv"];
@@ -15,11 +16,12 @@ const WS = args[0]; const VAULT = args[1] ? path.resolve(args[1]) : null;
 const DRY = args.includes('--dry-run');
 const NOFOLDERS = args.includes('--no-folders');
 const excludeArgs=[]; for(let _i=0;_i<args.length;_i++){ if(args[_i]==='--exclude'&&args[_i+1]){ excludeArgs.push(args[_i+1]); _i++; } }
+const excludeContentArgs=[]; for(let _j=0;_j<args.length;_j++){ if(args[_j]==='--exclude-content'&&args[_j+1]){ excludeContentArgs.push(args[_j+1]); _j++; } }
 const sIdx = args.indexOf('--sidecar');
 const SIDECAR = sIdx>=0 ? path.resolve(args[sIdx+1]) : (VAULT && path.join(VAULT,'.affine-sync.json'));
 const BASE = ENVV.AFFINE_BASE_URL;
 if (!BASE) { console.error('Set AFFINE_BASE_URL (e.g. https://affine.example.com)'); process.exit(2); }
-if (!WS || !VAULT) { console.error('usage: node affine-sync.js <workspaceId> <vaultDir> [--sidecar path] [--dry-run] [--no-folders] [--exclude glob]'); process.exit(2); }
+if (!WS || !VAULT) { console.error('usage: node affine-sync.js <workspaceId> <vaultDir> [--sidecar path] [--dry-run] [--no-folders] [--exclude glob] [--exclude-content substr]'); process.exit(2); }
 if (!ENVV.AFFINE_EMAIL && !ENVV.AFFINE_API_TOKEN) { console.error('Set AFFINE_EMAIL + AFFINE_PASSWORD (or AFFINE_API_TOKEN)'); process.exit(2); }
 
 const proc = spawn('npx',['-y','-p','affine-mcp-server','affine-mcp'],{stdio:['pipe','pipe','inherit'],env:ENVV});
@@ -56,9 +58,9 @@ function parseNote(abs){
   const raw=fs.readFileSync(abs,'utf8'); let body=raw, fm={};
   const m=raw.match(/^---\r?\n([\s\S]*?)\r?\n---\r?\n?/);
   if(m){ body=raw.slice(m[0].length); let key=null; for(const line of m[1].split(/\r?\n/)){
-    const li=line.match(/^\s*-\s+(.*)$/);                       // a list item is NEVER a key
+    const li=line.match(/^\s*-\s+(.*)$/);
     if(li){ if(key){ if(!Array.isArray(fm[key])) fm[key]=[]; fm[key].push(li[1].trim().replace(/^["']|["']$/g,'')); } continue; }
-    const kv=line.match(/^([A-Za-z0-9_][A-Za-z0-9_ -]*?):\s*(.*)$/); // key must start alnum; non-greedy to first colon
+    const kv=line.match(/^([A-Za-z0-9_][A-Za-z0-9_ -]*?):\s*(.*)$/);
     if(kv){ key=kv[1].trim().toLowerCase(); const v=kv[2].trim();
       if(v==='') fm[key]=[]; else if(v.startsWith('[')) fm[key]=v.replace(/^\[|\]$/g,'').split(',').map(s=>s.trim().replace(/^["']|["']$/g,'')).filter(Boolean);
       else fm[key]=v.replace(/^["']|["']$/g,''); } } }
@@ -69,7 +71,7 @@ function parseNote(abs){
   let rawTags=fm.tags; if(typeof rawTags==='string') rawTags=[rawTags]; if(!Array.isArray(rawTags)) rawTags=[];
   const tags=[]; for(const it of rawTags){ String(it).split(',').forEach(t=>{ t=t.replace(/^#/,'').replace(/^-\s+/,'').trim(); if(t) tags.push(t); }); }
   const icon=(typeof fm.icon==='string'&&fm.icon)?fm.icon.trim():null;
-  const props={}; for(const [k,v] of Object.entries(fm)){ if(RESERVED.has(k)) continue; if(Array.isArray(v)) continue; props[k]=inferProp(v); } // scalars only
+  const props={}; for(const [k,v] of Object.entries(fm)){ if(RESERVED.has(k)) continue; if(Array.isArray(v)) continue; props[k]=inferProp(v); }
   return {abs,base,h1,title,aliases,tags,icon,props,body,raw};
 }
 function resolveLinks(body,nameMap){ const un=[]; let n=0;
@@ -113,16 +115,21 @@ async function placeDoc(docId, leaf, rec){ await loadOrganize();
   else { try{ const r=JSON.parse(await call('add_organize_link',{workspaceId:WS,folderId:leaf,type:'doc',targetId:docId})); rec.orgNode=r.id; rec.orgParent=leaf; }catch(e){ console.log('link failed '+docId+': '+e.message); } } }
 
 (async()=>{ try{
-  await rpc('initialize',{protocolVersion:'2025-06-18',capabilities:{},clientInfo:{name:'affine-sync',version:'0.5'}});
+  await rpc('initialize',{protocolVersion:'2025-06-18',capabilities:{},clientInfo:{name:'affine-sync',version:'0.6'}});
   notify('notifications/initialized',{});
   let sidecar={workspaceId:WS,docs:{},folders:{}}; if(fs.existsSync(SIDECAR)){ try{ sidecar=JSON.parse(fs.readFileSync(SIDECAR,'utf8')); sidecar.docs=sidecar.docs||{}; sidecar.folders=sidecar.folders||{}; }catch{} }
   let ignoreLines=[]; const ignF=path.join(VAULT,'.affineignore'); if(fs.existsSync(ignF)){ try{ ignoreLines=fs.readFileSync(ignF,'utf8').split(/\r?\n/); }catch{} }
-  ignoreLines=ignoreLines.concat(excludeArgs); const ignoreRules=buildIgnore(ignoreLines);
+  ignoreLines=ignoreLines.concat(excludeArgs);
+  const contentFilters=[]; const pathLines=[];
+  for(const l of ignoreLines){ const sX=(l||'').replace(/\r$/,'').trim(); if(/^content:/i.test(sX)){ const c=sX.replace(/^content:/i,'').trim(); if(c) contentFilters.push(c); } else pathLines.push(l); }
+  for(const c of excludeContentArgs) if(c) contentFilters.push(c);
+  const ignoreRules=buildIgnore(pathLines);
   const allFiles=walk(VAULT).sort();
   const kept=allFiles.filter(f=>!isIgnored(path.relative(VAULT,f), ignoreRules));
-  const excluded=allFiles.length-kept.length;
-  const notes=kept.map(f=>({rel:path.relative(VAULT,f),...parseNote(f)}));
-  console.log('vault: '+VAULT+'  notes: '+notes.length+(excluded?'  (excluded '+excluded+')':'')+(DRY?'  [DRY-RUN]':''));
+  let notes=kept.map(f=>({rel:path.relative(VAULT,f),...parseNote(f)}));
+  let contentExcluded=0; if(contentFilters.length){ const b=notes.length; notes=notes.filter(nt=>!contentFilters.some(c=>nt.raw.includes(c))); contentExcluded=b-notes.length; }
+  const excluded=(allFiles.length-kept.length)+contentExcluded;
+  console.log('vault: '+VAULT+'  notes: '+notes.length+(excluded?'  (excluded '+excluded+(contentExcluded?', '+contentExcluded+' by content':'')+')':'')+(DRY?'  [DRY-RUN]':''));
   const save=()=>{ if(!DRY) try{ fs.writeFileSync(SIDECAR,JSON.stringify(sidecar,null,2)); }catch(e){ console.log('sidecar save failed: '+e.message);} };
   const report={tags:0,props:0,icons:0,err:[]};
   const nameMap={}; let created=0, foldered=0, i0=0;

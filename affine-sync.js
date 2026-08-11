@@ -3,20 +3,20 @@
 //
 //   AFFINE_BASE_URL=https://affine.example.com \
 //   AFFINE_EMAIL=you@example.com AFFINE_PASSWORD=... \
-//     node affine-sync.js <workspaceId> <vaultDir> [--sidecar <path>] [--dry-run]
+//     node affine-sync.js <workspaceId> <vaultDir> [--sidecar <path>] [--dry-run] [--no-folders]
 //
 // Identity via a sidecar JSON (default <vault>/.affine-sync.json) mapping each
-// note's relative path -> {docId,title,hash,tags,props}, so re-runs UPDATE in
-// place (no duplicates). Your markdown files are never modified.
+// note's relative path -> {docId,title,hash,tags,props,orgNode,orgParent}, so
+// re-runs UPDATE in place (no duplicates). Your markdown files are never modified.
 //
 // Converts: Obsidian [[wikilinks]] / [[Target|alias]] -> "form-A" links
 //   [label](<base>/workspace/<ws>/<docId>) which the AFFiNE frontend resolves
 //   to a real internal link; frontmatter `tags:` -> AFFiNE workspace tags;
 //   scalar frontmatter -> custom properties (text/number/checkbox/date);
-//   `icon:` -> doc icon; `title:` -> doc title. YAML frontmatter is stripped
-//   from the body (AFFiNE would otherwise mangle it into a heading). Only the
-//   metadata THIS tool applied (tracked in the sidecar) is reconciled, so tags
-//   or properties you add by hand in AFFiNE are never clobbered.
+//   `icon:` -> doc icon; `title:` -> doc title. Vault subfolders are mirrored as
+//   AFFiNE sidebar folders (disable with --no-folders). YAML frontmatter is
+//   stripped from the body. Only metadata THIS tool applied (tracked in the
+//   sidecar) is reconciled, so manual AFFiNE tags/props/placement aren't clobbered.
 //
 // Requires Node 18+ and network access (spawns `npx affine-mcp-server`).
 const { spawn } = require('child_process');
@@ -25,11 +25,12 @@ const ENVV = process["e"+"nv"];
 const args = process.argv.slice(2);
 const WS = args[0]; const VAULT = args[1] ? path.resolve(args[1]) : null;
 const DRY = args.includes('--dry-run');
+const NOFOLDERS = args.includes('--no-folders');
 const sIdx = args.indexOf('--sidecar');
 const SIDECAR = sIdx>=0 ? path.resolve(args[sIdx+1]) : (VAULT && path.join(VAULT,'.affine-sync.json'));
 const BASE = ENVV.AFFINE_BASE_URL;
 if (!BASE) { console.error('Set AFFINE_BASE_URL (your AFFiNE base URL, e.g. https://affine.example.com)'); process.exit(2); }
-if (!WS || !VAULT) { console.error('usage: node affine-sync.js <workspaceId> <vaultDir> [--sidecar path] [--dry-run]'); process.exit(2); }
+if (!WS || !VAULT) { console.error('usage: node affine-sync.js <workspaceId> <vaultDir> [--sidecar path] [--dry-run] [--no-folders]'); process.exit(2); }
 if (!ENVV.AFFINE_EMAIL && !ENVV.AFFINE_API_TOKEN) { console.error('Set AFFINE_EMAIL + AFFINE_PASSWORD (or AFFINE_API_TOKEN) for authentication'); process.exit(2); }
 
 const proc = spawn('npx',['-y','-p','affine-mcp-server','affine-mcp'],{stdio:['pipe','pipe','inherit'],env:ENVV});
@@ -90,10 +91,29 @@ async function applyMeta(nt,rec,report){
   rec.props=Object.keys(nt.props);
 }
 
+// --- organize (sidebar folders) ---
+let orgLoaded=false; const folderIndex=new Map(); const docLinkIndex=new Map();
+async function loadOrganize(){ if(orgLoaded) return; orgLoaded=true;
+  try{ const j=JSON.parse(await call('list_organize_nodes',{workspaceId:WS})); for(const nd of (j.nodes||[])){
+    if(nd.type==='folder') folderIndex.set((nd.parentId||'ROOT')+'\n'+nd.data, nd.id);
+    else if(nd.type==='doc') docLinkIndex.set(nd.data, {nodeId:nd.id, parentId:nd.parentId}); } }
+  catch(e){ console.log('organize load failed: '+e.message); } }
+async function ensureFolder(segs, sidecar){ await loadOrganize(); let parent=null, cur='';
+  for(const seg of segs){ cur=cur?cur+'/'+seg:seg; let fid=sidecar.folders[cur];
+    if(!fid){ const key=(parent||'ROOT')+'\n'+seg; fid=folderIndex.get(key);
+      if(!fid){ try{ const r=JSON.parse(await call('create_folder',{workspaceId:WS,name:seg,parentId:parent||undefined})); fid=r.id; folderIndex.set(key,fid); }catch(e){ console.log('folder create failed '+cur+': '+e.message); return null; } }
+      sidecar.folders[cur]=fid; }
+    parent=fid; }
+  return parent; }
+async function placeDoc(docId, leaf, rec){ await loadOrganize();
+  let cur=docLinkIndex.get(docId)||(rec.orgNode?{nodeId:rec.orgNode,parentId:rec.orgParent}:null);
+  if(cur&&cur.nodeId){ if(cur.parentId!==leaf){ try{ await call('move_organize_node',{workspaceId:WS,nodeId:cur.nodeId,parentId:leaf}); }catch(e){ console.log('move failed: '+e.message); } } rec.orgNode=cur.nodeId; rec.orgParent=leaf; }
+  else { try{ const r=JSON.parse(await call('add_organize_link',{workspaceId:WS,folderId:leaf,type:'doc',targetId:docId})); rec.orgNode=r.id; rec.orgParent=leaf; }catch(e){ console.log('link failed '+docId+': '+e.message); } } }
+
 (async()=>{ try{
-  await rpc('initialize',{protocolVersion:'2025-06-18',capabilities:{},clientInfo:{name:'affine-sync',version:'0.1'}});
+  await rpc('initialize',{protocolVersion:'2025-06-18',capabilities:{},clientInfo:{name:'affine-sync',version:'0.2'}});
   notify('notifications/initialized',{});
-  let sidecar={workspaceId:WS,docs:{}}; if(fs.existsSync(SIDECAR)){ try{ sidecar=JSON.parse(fs.readFileSync(SIDECAR,'utf8')); sidecar.docs=sidecar.docs||{}; }catch{} }
+  let sidecar={workspaceId:WS,docs:{},folders:{}}; if(fs.existsSync(SIDECAR)){ try{ sidecar=JSON.parse(fs.readFileSync(SIDECAR,'utf8')); sidecar.docs=sidecar.docs||{}; sidecar.folders=sidecar.folders||{}; }catch{} }
   const notes=walk(VAULT).sort().map(f=>({rel:path.relative(VAULT,f),...parseNote(f)}));
   console.log('vault: '+VAULT+'  notes: '+notes.length+(DRY?'  [DRY-RUN]':''));
   const save=()=>{ if(!DRY) try{ fs.writeFileSync(SIDECAR,JSON.stringify(sidecar,null,2)); }catch(e){ console.log('sidecar save failed: '+e.message);} };
@@ -114,11 +134,20 @@ async function applyMeta(nt,rec,report){
     if(!DRY){ try{ await call('replace_doc_with_markdown',{workspaceId:WS,docId:nt.docId,markdown:out}); }catch(e){ console.log('update FAILED '+nt.rel+': '+e.message); continue; } await applyMeta(nt,rec,report); }
     rec.hash=h; updated++; save();
   }
+
+  // Folder pass: mirror subfolders as AFFiNE sidebar folders
+  let foldered=0;
+  if(!NOFOLDERS && !DRY){ for(const nt of notes){ const dir=path.dirname(nt.rel);
+      if(dir==='.'||dir==='') continue; const rec=sidecar.docs[nt.rel]; if(!rec||!rec.docId) continue;
+      if(rec.orgParent && sidecar.folders[dir]===rec.orgParent) continue;
+      const leaf=await ensureFolder(dir.split(path.sep), sidecar); if(leaf){ await placeDoc(rec.docId, leaf, rec); foldered++; } }
+    save(); }
+
   const orphans=Object.keys(sidecar.docs).filter(r=>!notes.find(n=>n.rel===r));
   save();
   console.log('--- sync summary ---');
   console.log('created='+created+'  updated='+updated+'  unchanged='+skipped);
-  console.log('links resolved='+links+'  tags applied='+report.tags+'  props set='+report.props+'  icons='+report.icons);
+  console.log('links resolved='+links+'  tags applied='+report.tags+'  props set='+report.props+'  icons='+report.icons+'  foldered='+foldered);
   if(Object.keys(unres).length) console.log('UNRESOLVED links: '+JSON.stringify(unres));
   if(report.err.length) console.log('META ERRORS: '+JSON.stringify(report.err.slice(0,10)));
   if(orphans.length) console.log('ORPHANS (not deleted): '+JSON.stringify(orphans));

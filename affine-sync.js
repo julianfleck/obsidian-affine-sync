@@ -149,7 +149,7 @@ async function placeDoc(docId, leaf, rec){ await loadOrganize();
       if(!DRY){ try{ docId=JSON.parse(await call('create_doc_from_markdown',{workspaceId:WS,title:nt.title,markdown:nt.body})).docId; }catch(e){ console.log('create FAILED '+nt.rel+': '+e.message); } }
       rec=sidecar.docs[nt.rel]={docId,title:nt.title,hash:null,tags:[],props:[]}; created++; }
     nt.docId=rec.docId; if(!propSampleDoc) propSampleDoc=rec.docId;
-    for(const k of [nt.base,nt.title,nt.h1,...nt.aliases].filter(Boolean)) nameMap[k.toLowerCase()]=rec.docId;
+    { const parts=nt.rel.replace(/\.md$/i,'').split(path.sep); for(let i=0;i<parts.length;i++){ nameMap[parts.slice(i).join('/').toLowerCase()]=rec.docId; } for(const k of [nt.title,nt.h1,...nt.aliases].filter(Boolean)) if(k) nameMap[k.toLowerCase()]=rec.docId; }
   }
   save();
   const report={tags:0,props:0,icons:0,err:[]}; let updated=0,skipped=0,links=0; const unres={};

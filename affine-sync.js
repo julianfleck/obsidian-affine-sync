@@ -5,22 +5,12 @@
 //   AFFINE_EMAIL=you@example.com AFFINE_PASSWORD=... \
 //     node affine-sync.js <workspaceId> <vaultDir> [--sidecar <path>] [--dry-run] [--no-folders] [--exclude <glob>]
 //
-// Excludes: a `.affineignore` file in the vault root (gitignore syntax: globs,
-// `#` comments, `!` negation, `**`) and/or repeated --exclude <glob> flags.
-//
-// Identity via a sidecar JSON (default <vault>/.affine-sync.json) mapping each
-// note's relative path -> {docId,title,hash,tags,props,orgNode,orgParent}, so
-// re-runs UPDATE in place (no duplicates). Your markdown files are never modified.
-//
-// Converts: Obsidian [[wikilinks]] / [[Target|alias]] -> "form-A" links
-//   [label](<base>/workspace/<ws>/<docId>) which the AFFiNE frontend resolves
-//   to a real internal link; frontmatter `tags:` -> AFFiNE workspace tags;
-//   scalar frontmatter -> custom properties (text/number/checkbox/date);
-//   `icon:` -> doc icon; `title:` -> doc title. Vault subfolders are mirrored as
-//   AFFiNE sidebar folders (disable with --no-folders). YAML frontmatter is
-//   stripped from the body. Only metadata THIS tool applied (tracked in the
-//   sidecar) is reconciled, so manual AFFiNE tags/props/placement aren't clobbered.
-//
+// Excludes: a `.affineignore` file in the vault root (gitignore syntax) and/or --exclude <glob>.
+// Identity via a sidecar JSON (default <vault>/.affine-sync.json) mapping each note's relative
+// path -> {docId,title,hash,tags,props,orgNode,orgParent}; re-runs UPDATE in place (no dupes).
+// Converts [[wikilinks]] -> form-A links, frontmatter -> tags/properties/icon/title, and mirrors
+// subfolders as AFFiNE sidebar folders (progressively, as each doc is created). Markdown import
+// runs non-strict (best-effort: imperfect links become warnings, not a whole-doc abort).
 // Requires Node 18+ and network access (spawns `npx affine-mcp-server`).
 const { spawn } = require('child_process');
 const fs = require('fs'); const path = require('path'); const crypto = require('crypto');
@@ -33,9 +23,9 @@ const excludeArgs=[]; for(let _i=0;_i<args.length;_i++){ if(args[_i]==='--exclud
 const sIdx = args.indexOf('--sidecar');
 const SIDECAR = sIdx>=0 ? path.resolve(args[sIdx+1]) : (VAULT && path.join(VAULT,'.affine-sync.json'));
 const BASE = ENVV.AFFINE_BASE_URL;
-if (!BASE) { console.error('Set AFFINE_BASE_URL (your AFFiNE base URL, e.g. https://affine.example.com)'); process.exit(2); }
+if (!BASE) { console.error('Set AFFINE_BASE_URL (e.g. https://affine.example.com)'); process.exit(2); }
 if (!WS || !VAULT) { console.error('usage: node affine-sync.js <workspaceId> <vaultDir> [--sidecar path] [--dry-run] [--no-folders] [--exclude glob]'); process.exit(2); }
-if (!ENVV.AFFINE_EMAIL && !ENVV.AFFINE_API_TOKEN) { console.error('Set AFFINE_EMAIL + AFFINE_PASSWORD (or AFFINE_API_TOKEN) for authentication'); process.exit(2); }
+if (!ENVV.AFFINE_EMAIL && !ENVV.AFFINE_API_TOKEN) { console.error('Set AFFINE_EMAIL + AFFINE_PASSWORD (or AFFINE_API_TOKEN)'); process.exit(2); }
 
 const proc = spawn('npx',['-y','-p','affine-mcp-server','affine-mcp'],{stdio:['pipe','pipe','inherit'],env:ENVV});
 let buf=''; const pending=new Map(); let idc=1;
@@ -46,7 +36,6 @@ const txt=r=>{try{return r.result.content.map(c=>c.text).join('\n')}catch{return
 const call=async(n,a)=>txt(await rpc('tools/call',{name:n,arguments:a}));
 
 const SKIP=new Set(['.git','node_modules','.obsidian','.trash','.affine']);
-// --- gitignore-style excludes (.affineignore + --exclude) ---
 function ignPatToRe(line){ let p=(line||'').replace(/\r$/,'').trim(); if(!p||p.startsWith('#')) return null;
   let neg=false; if(p.startsWith('!')){ neg=true; p=p.slice(1); }
   let dirOnly=false; if(p.endsWith('/')){ dirOnly=true; p=p.replace(/\/+$/,''); }
@@ -55,8 +44,7 @@ function ignPatToRe(line){ let p=(line||'').replace(/\r$/,'').trim(); if(!p||p.s
   for(let i=0;i<cs.length;i++){ const c=cs[i];
     if(c==='*'){ if(cs[i+1]==='*'){ i++; if(cs[i+1]==='/'){ i++; re+='(?:[^/]+/)*'; } else re+='.*'; } else re+='[^/]*'; }
     else if(c==='?') re+='[^/]';
-    else if('\\^$.|+()[]{}'.includes(c)) re+='\\'+c;
-    else re+=c; }
+    else if('\\^$.|+()[]{}'.includes(c)) re+='\\'+c; else re+=c; }
   const start=(anchored||hasSlash)?'^':'(?:^|.*/)'; const end=dirOnly?'/':'(?:$|/)';
   return {neg, re:new RegExp(start+re+end)}; }
 function buildIgnore(lines){ const r=[]; for(const l of lines){ const x=ignPatToRe(l); if(x) r.push(x); } return r; }
@@ -92,16 +80,16 @@ function resolveLinks(body,nameMap){ const un=[]; let n=0;
   const out=body.replace(/\[\[([^\]|#]+)(?:#[^\]|]+)?(?:\|([^\]]+))?\]\]/g,(mm,t,al)=>{ const id=nameMap[t.trim().toLowerCase()]; const label=(al||t).trim(); if(id){n++;return '['+label+']('+BASE+'/workspace/'+WS+'/'+id+')';} un.push(t.trim()); return mm; });
   return {out,n,un}; }
 const sha=s=>crypto.createHash('sha1').update(s).digest('hex').slice(0,16);
+const bodyFor=nt=> nt.body.trim() ? nt.body : (nt.title||nt.base||'untitled');
 
 let propDefs=null, propSampleDoc=null;
 async function ensureDefsLoaded(){ if(propDefs) return; propDefs=new Map(); if(!propSampleDoc) return;
   try{ const j=JSON.parse(await call('list_doc_properties',{workspaceId:WS,docId:propSampleDoc})); const defs=j.definitions||j.properties||[]; for(const d of defs){ if(d&&d.name) propDefs.set(String(d.name).toLowerCase(),d);} }catch{} }
 async function ensureProp(name,type){ await ensureDefsLoaded(); if(propDefs.has(name.toLowerCase())) return; try{ await call('create_custom_property',{workspaceId:WS,name,type}); }catch{} propDefs.set(name.toLowerCase(),{name,type}); }
-
 async function applyMeta(nt,rec,report){
   if(rec.title!==nt.title){ try{ await call('update_doc_title',{workspaceId:WS,docId:nt.docId,title:nt.title}); rec.title=nt.title; }catch(e){ report.err.push('title '+nt.rel+': '+e.message); } }
   const prev=rec.tags||[];
-  for(const t of nt.tags){ try{ await call('add_tag_to_doc',{workspaceId:WS,docId:nt.docId,tag:t}); }catch(e){ report.err.push('tag+ '+t+': '+e.message); } }
+  for(const t of nt.tags){ try{ await call('add_tag_to_doc',{workspaceId:WS,docId:nt.docId,tag:t}); }catch(e){ report.err.push('tag '+t+': '+e.message); } }
   for(const t of prev.filter(x=>!nt.tags.includes(x))){ try{ await call('remove_tag_from_doc',{workspaceId:WS,docId:nt.docId,tag:t}); }catch{} }
   rec.tags=nt.tags; report.tags+=nt.tags.length;
   if(nt.icon){ try{ await call('update_doc_icon',{workspaceId:WS,docId:nt.docId,icon:nt.icon}); report.icons++; }catch(e){ report.err.push('icon: '+e.message); } }
@@ -110,7 +98,6 @@ async function applyMeta(nt,rec,report){
   for(const name of prevP.filter(p=>!(p in nt.props))){ try{ await call('clear_doc_property',{workspaceId:WS,docId:nt.docId,property:name}); }catch{} }
   rec.props=Object.keys(nt.props);
 }
-
 let orgLoaded=false; const folderIndex=new Map(); const docLinkIndex=new Map();
 async function loadOrganize(){ if(orgLoaded) return; orgLoaded=true;
   try{ const j=JSON.parse(await call('list_organize_nodes',{workspaceId:WS})); for(const nd of (j.nodes||[])){
@@ -130,10 +117,9 @@ async function placeDoc(docId, leaf, rec){ await loadOrganize();
   else { try{ const r=JSON.parse(await call('add_organize_link',{workspaceId:WS,folderId:leaf,type:'doc',targetId:docId})); rec.orgNode=r.id; rec.orgParent=leaf; }catch(e){ console.log('link failed '+docId+': '+e.message); } } }
 
 (async()=>{ try{
-  await rpc('initialize',{protocolVersion:'2025-06-18',capabilities:{},clientInfo:{name:'affine-sync',version:'0.3'}});
+  await rpc('initialize',{protocolVersion:'2025-06-18',capabilities:{},clientInfo:{name:'affine-sync',version:'0.4'}});
   notify('notifications/initialized',{});
   let sidecar={workspaceId:WS,docs:{},folders:{}}; if(fs.existsSync(SIDECAR)){ try{ sidecar=JSON.parse(fs.readFileSync(SIDECAR,'utf8')); sidecar.docs=sidecar.docs||{}; sidecar.folders=sidecar.folders||{}; }catch{} }
-
   let ignoreLines=[]; const ignF=path.join(VAULT,'.affineignore'); if(fs.existsSync(ignF)){ try{ ignoreLines=fs.readFileSync(ignF,'utf8').split(/\r?\n/); }catch{} }
   ignoreLines=ignoreLines.concat(excludeArgs); const ignoreRules=buildIgnore(ignoreLines);
   const allFiles=walk(VAULT).sort();
@@ -143,38 +129,45 @@ async function placeDoc(docId, leaf, rec){ await loadOrganize();
   console.log('vault: '+VAULT+'  notes: '+notes.length+(excluded?'  (excluded '+excluded+')':'')+(DRY?'  [DRY-RUN]':''));
   const save=()=>{ if(!DRY) try{ fs.writeFileSync(SIDECAR,JSON.stringify(sidecar,null,2)); }catch(e){ console.log('sidecar save failed: '+e.message);} };
 
-  const nameMap={}; let created=0;
-  for(const nt of notes){ let rec=sidecar.docs[nt.rel];
-    if(!rec||!rec.docId){ let docId=DRY?('DRY-'+sha(nt.rel)):null;
-      if(!DRY){ try{ docId=JSON.parse(await call('create_doc_from_markdown',{workspaceId:WS,title:nt.title,markdown:nt.body})).docId; }catch(e){ console.log('create FAILED '+nt.rel+': '+e.message); } }
-      rec=sidecar.docs[nt.rel]={docId,title:nt.title,hash:null,tags:[],props:[]}; created++; if(!DRY && created%50===0) save(); }
-    nt.docId=rec.docId; if(!propSampleDoc) propSampleDoc=rec.docId;
-    { const parts=nt.rel.replace(/\.md$/i,'').split(path.sep); for(let i=0;i<parts.length;i++){ nameMap[parts.slice(i).join('/').toLowerCase()]=rec.docId; } for(const k of [nt.title,nt.h1,...nt.aliases].filter(Boolean)) if(k) nameMap[k.toLowerCase()]=rec.docId; }
+  const report={tags:0,props:0,icons:0,err:[]};
+  const nameMap={}; let created=0, foldered=0, i0=0;
+  // Pass 1: ensure doc + progressive metadata + folder; build nameMap
+  for(const nt of notes){ i0++;
+    let rec=sidecar.docs[nt.rel]; const isNew=!rec||!rec.docId; const h=sha(nt.raw);
+    if(isNew){ let docId=DRY?('DRY-'+sha(nt.rel)):null;
+      if(!DRY){ try{ docId=JSON.parse(await call('create_doc_from_markdown',{workspaceId:WS,title:nt.title,markdown:bodyFor(nt),strict:false})).docId; }catch(e){ console.log('create FAILED '+nt.rel+': '+e.message); } }
+      rec=sidecar.docs[nt.rel]={docId,title:nt.title,hash:null,tags:[],props:[]}; created++; }
+    nt._new=isNew; nt.docId=rec.docId; if(!propSampleDoc) propSampleDoc=rec.docId;
+    { const parts=nt.rel.replace(/\.md$/i,'').split(path.sep); for(let i=0;i<parts.length;i++) nameMap[parts.slice(i).join('/').toLowerCase()]=rec.docId; for(const k of [nt.title,nt.h1,...nt.aliases].filter(Boolean)) if(k) nameMap[k.toLowerCase()]=rec.docId; }
+    if(!DRY && rec.docId && rec.hash!==h){
+      await applyMeta(nt,rec,report);
+      if(!NOFOLDERS){ const dir=path.dirname(nt.rel); if(dir!=='.'&&dir!==''){ if(!(rec.orgParent && sidecar.folders[dir]===rec.orgParent)){ const leaf=await ensureFolder(dir.split(path.sep),sidecar); if(leaf){ await placeDoc(rec.docId,leaf,rec); foldered++; } } } }
+    }
+    if(i0%25===0){ save(); process.stdout.write('  pass1 '+i0+'/'+notes.length+' (created '+created+', foldered '+foldered+')\n'); }
   }
   save();
-  const report={tags:0,props:0,icons:0,err:[]}; let updated=0,skipped=0,links=0; const unres={};
-  for(const nt of notes){ const {out,n,un}=resolveLinks(nt.body,nameMap); links+=n; un.forEach(u=>unres[u]=(unres[u]||0)+1);
-    const h=sha(nt.raw); const rec=sidecar.docs[nt.rel];
+  // Pass 2: resolve links; push body only where needed
+  let updated=0, skipped=0, links=0, i1=0; const unres={};
+  for(const nt of notes){ i1++;
+    const rec=sidecar.docs[nt.rel]; if(!rec||!rec.docId) continue;
+    const {out,n,un}=resolveLinks(nt.body,nameMap); links+=n; un.forEach(u=>unres[u]=(unres[u]||0)+1);
+    const h=sha(nt.raw);
     if(rec.hash===h){ skipped++; continue; }
-    if(!DRY){ try{ await call('replace_doc_with_markdown',{workspaceId:WS,docId:nt.docId,markdown:out}); }catch(e){ console.log('update FAILED '+nt.rel+': '+e.message); continue; } await applyMeta(nt,rec,report); }
-    rec.hash=h; updated++; save();
+    const cbody=bodyFor(nt); const fbody=nt.body.trim()?out:cbody;
+    if(nt._new && fbody===cbody){ rec.hash=h; save(); continue; }
+    if(!DRY){ try{ await call('replace_doc_with_markdown',{workspaceId:WS,docId:rec.docId,markdown:fbody,strict:false}); }catch(e){ console.log('update FAILED '+nt.rel+': '+e.message); continue; } }
+    rec.hash=h; updated++; if(i1%50===0) save();
   }
-
-  let foldered=0;
-  if(!NOFOLDERS && !DRY){ for(const nt of notes){ const dir=path.dirname(nt.rel);
-      if(dir==='.'||dir==='') continue; const rec=sidecar.docs[nt.rel]; if(!rec||!rec.docId) continue;
-      if(rec.orgParent && sidecar.folders[dir]===rec.orgParent) continue;
-      const leaf=await ensureFolder(dir.split(path.sep), sidecar); if(leaf){ await placeDoc(rec.docId, leaf, rec); foldered++; } }
-    save(); }
-
-  const orphans=Object.keys(sidecar.docs).filter(r=>!notes.find(n=>n.rel===r));
   save();
+  const orphans=Object.keys(sidecar.docs).filter(r=>!notes.find(n=>n.rel===r));
   console.log('--- sync summary ---');
-  console.log('created='+created+'  updated='+updated+'  unchanged='+skipped+'  excluded='+excluded);
-  console.log('links resolved='+links+'  tags applied='+report.tags+'  props set='+report.props+'  icons='+report.icons+'  foldered='+foldered);
-  if(Object.keys(unres).length) console.log('UNRESOLVED links ('+Object.keys(unres).length+' targets): '+JSON.stringify(Object.fromEntries(Object.entries(unres).slice(0,20))));
-  if(report.err.length) console.log('META ERRORS ('+report.err.length+'): '+JSON.stringify(report.err.slice(0,10)));
-  if(orphans.length) console.log('ORPHANS ('+orphans.length+', not deleted): '+JSON.stringify(orphans.slice(0,20)));
+  console.log('created='+created+'  body-updated='+updated+'  excluded='+excluded);
+  console.log('links resolved='+links+'  tags='+report.tags+'  props='+report.props+'  icons='+report.icons+'  foldered='+foldered);
+  const nullDocs=Object.values(sidecar.docs).filter(d=>!d.docId).length;
+  if(nullDocs) console.log('CREATE FAILURES still pending (docId null): '+nullDocs);
+  if(Object.keys(unres).length) console.log('UNRESOLVED link targets: '+Object.keys(unres).length+' (dangling; will resolve later if created)');
+  if(report.err.length) console.log('META ERRORS ('+report.err.length+'): '+JSON.stringify(report.err.slice(0,8)));
+  if(orphans.length) console.log('ORPHANS ('+orphans.length+', not deleted)');
   console.log('sidecar: '+SIDECAR);
   proc.kill(); process.exit(0);
 }catch(e){ console.error('FATAL',e.message); proc.kill(); process.exit(1);} })();

@@ -19,7 +19,8 @@
   | `tags:` (list/inline) | workspace tags |
   | `icon:` (emoji) | doc icon |
   | scalar keys (`status: active`, `priority: 2`, `done: true`, `due: 2026-08-11`) | custom properties (text / number / checkbox / date, inferred) |
-- **Folders** — vault subfolders are recreated as AFFiNE sidebar folders (nested), and each note is placed in its folder. Moving a note between folders relocates it on the next sync. Disable with `--no-folders`.
+- **Folders** — vault subfolders are recreated as AFFiNE sidebar folders (nested), each note placed in its folder; moved notes relocate on the next sync. Disable with `--no-folders`.
+- **Excludes** — a **`.affineignore`** file in the vault root (gitignore syntax: globs, `#` comments, `!` negation, `**`) and/or repeated `--exclude <glob>` flags keep notes out of the sync. (Only `.md` files are synced; `.mdx` and other extensions are ignored.)
 - **Non-destructive metadata** — only the tags/properties/placement this tool applied (tracked in the sidecar) are reconciled, so anything you add by hand in AFFiNE is left alone.
 - **`--dry-run`** — see what would be created/linked without writing anything.
 
@@ -35,7 +36,7 @@ export AFFINE_BASE_URL="https://affine.example.com"
 export AFFINE_EMAIL="you@example.com"
 export AFFINE_PASSWORD="..."           # or: export AFFINE_API_TOKEN="ut_..."
 
-node affine-sync.js <workspaceId> <vaultDir> [--sidecar <path>] [--dry-run] [--no-folders]
+node affine-sync.js <workspaceId> <vaultDir> [--sidecar <path>] [--dry-run] [--no-folders] [--exclude <glob>]
 ```
 
 - `<workspaceId>` — the AFFiNE workspace UUID (find it in the workspace URL, or list them with the MCP server).
@@ -43,6 +44,19 @@ node affine-sync.js <workspaceId> <vaultDir> [--sidecar <path>] [--dry-run] [--n
 - `--sidecar <path>` — override the sidecar location (default `<vaultDir>/.affine-sync.json`).
 - `--dry-run` — plan only, no writes.
 - `--no-folders` — do not mirror subfolders as AFFiNE sidebar folders.
+- `--exclude <glob>` — exclude paths (repeatable); combined with `<vaultDir>/.affineignore`.
+
+### `.affineignore`
+
+Put a `.affineignore` in the vault root, gitignore-style:
+
+```gitignore
+# don't sync these
+TRASH/
+templates/
+Readwise/
+drafts/**/*.private.md
+```
 
 Example first run:
 
@@ -68,8 +82,11 @@ The tool drives AFFiNE through the `affine-mcp-server` (Model Context Protocol) 
 ## Roadmap
 
 - [x] Mirror vault subfolders as AFFiNE sidebar folders (organize API)
+- [x] `.affineignore` / `--exclude` path filtering
+- [ ] Map Obsidian daily notes to AFFiNE **journal** entries — the journal date is a reserved `journal` key in AFFiNE's `docProperties` CRDT, which the MCP can't currently write; needs upstream `affine-mcp-server` support
+- [ ] Multi-sync config (`--config`) for several vault→workspace jobs
 - [ ] Optional deletion of orphaned docs
-- [ ] Bidirectional sync (AFFiNE → Markdown) with conflict handling — non-trivial due to export escaping, LinkedPage/property round-tripping, and merge semantics
+- [ ] Bidirectional sync (AFFiNE → Markdown) with conflict handling
 
 ## License
 

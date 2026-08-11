@@ -27,5 +27,9 @@
     "url": "git+https://github.com/julianfleck/obsidian-affine-sync.git"
   },
   "author": "Julian Fleck",
-  "license": "Apache-2.0"
+  "license": "Apache-2.0",
+  "dependencies": {
+    "socket.io-client": "^4.8.3",
+    "yjs": "^13.6.32"
+  }
 }

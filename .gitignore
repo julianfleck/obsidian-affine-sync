@@ -3,3 +3,7 @@ node_modules/
 .affine-sync.json
 *.log
 .DS_Store
+
+# local dev/test harnesses (env-specific paths)
+test-*.cjs
+seed.cjs

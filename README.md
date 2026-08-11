@@ -91,3 +91,46 @@ The tool drives AFFiNE through the `affine-mcp-server` (Model Context Protocol) 
 ## License
 
 Apache-2.0 © Julian Fleck
+
+## Bidirectional sync (experimental): `affine-live.js`
+
+`affine-sync.js` pushes your vault **into** AFFiNE. `affine-live.js` is the reverse
+direction — a persistent process that watches AFFiNE for edits and writes them **back**
+into your vault Markdown, so changes made in the AFFiNE UI land in your files.
+
+It connects to AFFiNE's realtime sync socket as a headless Yjs peer (the same protocol
+the web app uses), so it sees an edit the moment the browser flushes it — even on an
+always-open, multi-user workspace. On a change it:
+
+1. **renders** the doc to Markdown via the vendored AFFiNE converter in
+   `vendor/affine-markdown/` (MIT — see its `NOTICE.md`);
+2. **reconciles** AFFiNE's lossy export back toward vault style (`reconcile.js`):
+   unescape punctuation, decode hard breaks, restore bare-domain autolinks, un-bold
+   table headers, `form-A` doc URLs → `[[wikilinks]]`;
+3. **converges** (`writeback.js`): diffs the vault file directly against the current
+   render and applies each genuine content difference as a minimal, in-place edit —
+   never a whole-file overwrite. Blank-only (formatting) and table/structural hunks
+   are skipped, not force-applied.
+
+Writes are atomic (temp + rename). Version control is left to you — there is no git
+built in.
+
+```bash
+export AFFINE_BASE_URL="https://affine.example.com"
+export AFFINE_EMAIL="you@example.com"
+export AFFINE_PASSWORD="..."          # or AFFINE_API_TOKEN
+export WS_ID="<workspace-id>"
+
+node affine-live.js <vaultDir> \
+  --sidecar  <vaultDir>/.affine-sync.json \
+  --state    <path>/live-state.json \
+  --preview  <path>/live-preview \
+  --write                              # omit --write for detect-only (dry run)
+```
+
+**Status / limits.** Detection, reconciliation, and change-only write-back of
+paragraph/line edits work end-to-end. In progress: table (and other block-level
+structural) changes are detected but **skipped** for safety rather than applied;
+inserted lines with an ambiguous anchor are skipped; AFFiNE-native new docs (not in
+the sidecar) are not created yet. Requires the `socket.io-client` and `yjs`
+dependencies.

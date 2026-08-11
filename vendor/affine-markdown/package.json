@@ -1,0 +1,6 @@
+{
+  "name": "affine-markdown",
+  "private": true,
+  "type": "module",
+  "description": "Vendored AFFiNE BlockSuite Y.Doc -> Markdown converter (render + extract). See NOTICE."
+}

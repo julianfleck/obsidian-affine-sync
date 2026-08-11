@@ -70,8 +70,8 @@ function parseNote(abs){
   const h1=(body.match(/^#\s+(.+)$/m)||[])[1];
   const title=(typeof fm.title==='string'&&fm.title)||h1||base;
   const aliases=Array.isArray(fm.aliases)?fm.aliases:(typeof fm.aliases==='string'?[fm.aliases]:[]);
-  let tags=fm.tags; if(typeof tags==='string') tags=[tags]; if(!Array.isArray(tags)) tags=[];
-  tags=tags.map(t=>String(t).replace(/^#/,'').trim()).filter(Boolean);
+  let rawTags=fm.tags; if(typeof rawTags==='string') rawTags=[rawTags]; if(!Array.isArray(rawTags)) rawTags=[];
+  const tags=[]; for(const it of rawTags){ String(it).split(',').forEach(t=>{ t=t.replace(/^#/,'').replace(/^-\s+/,'').trim(); if(t) tags.push(t); }); }
   const icon=(typeof fm.icon==='string'&&fm.icon)?fm.icon.trim():null;
   const props={}; for(const [k,v] of Object.entries(fm)){ if(RESERVED.has(k)) continue; if(Array.isArray(v)&&v.length===0) continue; props[k]=inferProp(v); }
   return {abs,base,h1,title,aliases,tags,icon,props,body,raw};

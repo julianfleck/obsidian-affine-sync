@@ -135,6 +135,21 @@ function collectDocForMarkdown(doc) {
 // Accepts a Y.Doc OR a Yjs update (Uint8Array/Buffer). Prefer passing the raw
 // update bytes so the doc is built HERE with this module's yjs instance —
 // crossing yjs instances breaks every `instanceof` check in the extractor.
+// Read the workspace's page list (id/title/trash) from the workspace root doc's
+// meta.pages — used to detect docs removed/trashed in AFFiNE. Accepts a Y.Doc or
+// raw update bytes (built here with this module's yjs, same as docToMarkdown).
+export function workspacePages(input) {
+  let ydoc;
+  if (input instanceof Y.Doc) ydoc = input;
+  else { ydoc = new Y.Doc(); Y.applyUpdate(ydoc, input instanceof Uint8Array ? input : new Uint8Array(input)); }
+  const pages = ydoc.getMap('meta').get('pages');
+  const out = [];
+  if (pages && pages.forEach) pages.forEach((p) => {
+    if (p instanceof Y.Map) out.push({ id: String(p.get('id') || ''), title: p.get('title') || '', trash: !!p.get('trash') });
+  });
+  return out;
+}
+
 export function docToMarkdown(input) {
   let ydoc;
   if (input instanceof Y.Doc) {

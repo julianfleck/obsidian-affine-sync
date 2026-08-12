@@ -44,6 +44,8 @@ const WRITE = args.includes('--write');           // opt-in: actually patch vaul
 const DEBOUNCE = Number(g('--debounce', 4000));   // quiet period before a check
 const MAXWAIT = Number(g('--maxwait', 30000));    // cap: check at least this often during a continuous edit
 const NEWDOC_DIR = g('--new-doc-dir', '_affine-inbox'); // where AFFiNE-native new docs land (vault-relative)
+const TRASH_DIR = g('--trash-dir', '_affine-trash');    // where docs removed in AFFiNE are moved (recoverable)
+const SWEEP_MS = Number(g('--delete-sweep', 900000));   // how often to check AFFiNE for removed docs (0 disables)
 
 const BASE = (ENV.AFFINE_BASE_URL || '').replace(/\/$/, '');
 const WS = ENV.WS_ID;
@@ -111,11 +113,11 @@ function emitAck(socket, event, payload, timeoutMs = 20000) {
   log('sidecar docs: ' + Object.keys(rev).length + ' | state lastSync=' + (state.lastSync ? new Date(state.lastSync).toISOString() : 'none') + ' | baselines=' + Object.keys(state.docs).length + ' | write-back=' + (WRITE ? 'ON (patches vault files)' : 'off (detect only)'));
 
   // load the vendored ESM converter (Y.Doc -> markdown); fall back to plain text
-  let docToMarkdown = null;
+  let docToMarkdown = null, workspacePages = null;
   try {
     const { pathToFileURL } = require('url');
     const p = path.join(__dirname, 'vendor', 'affine-markdown', 'extract.js');
-    ({ docToMarkdown } = await import(pathToFileURL(p).href));
+    ({ docToMarkdown, workspacePages } = await import(pathToFileURL(p).href));
     log('converter loaded (vendored render.js)');
   } catch (e) { log('converter load FAILED (' + e.message + ') — falling back to plain-text hash'); }
 
@@ -182,6 +184,55 @@ function emitAck(socket, event, payload, timeoutMs = 20000) {
       return;
     }
     createNewDoc(docId, newMd); // brand-new AFFiNE doc
+  }
+
+  // move a vault file whose AFFiNE doc was removed into the trash dir (recoverable)
+  function trashFile(docId, rel) {
+    const from = path.join(VAULT, rel);
+    if (!fs.existsSync(from)) { delete rev[docId]; if (state.docs[docId]) delete state.docs[docId]; return 'gone'; }
+    let to = path.join(VAULT, TRASH_DIR, rel);
+    try {
+      fs.mkdirSync(path.dirname(to), { recursive: true });
+      if (fs.existsSync(to)) to = to.replace(/\.md$/i, '') + '-' + docId + '.md';
+      fs.renameSync(from, to);
+    } catch (e) { log('  trash err ' + rel + ': ' + e.message); return false; }
+    delete rev[docId];
+    if (state.docs[docId]) delete state.docs[docId];
+    log('  🗑 TRASHED ' + rel + ' → ' + TRASH_DIR + '/  (removed in AFFiNE)');
+    return true;
+  }
+
+  // periodically reconcile AFFiNE's page list against our mapped files; a mapped
+  // doc that is now trashed/gone in AFFiNE gets moved to the trash dir. Guarded:
+  // never act on an empty/partial page list, cap the fraction removed per sweep,
+  // and require two consecutive sweeps before moving anything.
+  async function deletionSweep() {
+    if (!workspacePages) return;
+    let pages;
+    try {
+      const ack = await emitAck(socket, 'space:load-doc', { spaceType: 'workspace', spaceId: WS, docId: WS });
+      const missing = ack && ack.data && ack.data.missing;
+      if (typeof missing !== 'string') return;
+      pages = workspacePages(Buffer.from(missing, 'base64'));
+    } catch (e) { log('deletion sweep: load err ' + e.message); return; }
+    if (!pages || !pages.length) { log('deletion sweep: empty page list — skipping (guard)'); return; }
+    const live = new Set(pages.filter((p) => !p.trash).map((p) => p.id));
+    const mapped = Object.entries(state.docs).filter(([, r]) => r && r.rel);
+    const candidates = mapped.filter(([id]) => !live.has(id));
+    if (candidates.length > Math.max(20, Math.floor(mapped.length * 0.2))) {
+      log('deletion sweep: ' + candidates.length + '/' + mapped.length + ' mapped docs look removed — TOO MANY, skipping (suspicious fetch)');
+      return;
+    }
+    state.missing = state.missing || {};
+    for (const id of Object.keys(state.missing)) if (live.has(id)) delete state.missing[id];
+    let trashed = 0, pending = 0;
+    for (const [docId, r] of candidates) {
+      state.missing[docId] = (state.missing[docId] || 0) + 1;
+      if (state.missing[docId] >= 2) { if (trashFile(docId, r.rel)) trashed++; delete state.missing[docId]; }
+      else pending++;
+    }
+    log('deletion sweep: mapped ' + mapped.length + ', live ' + live.size + ', removed-candidates ' + candidates.length + (trashed ? ', TRASHED ' + trashed : '') + (pending ? ', pending-confirm ' + pending : ''));
+    if (trashed || pending) saveState(state);
   }
 
   async function checkDoc(docId, ts) {
@@ -256,7 +307,7 @@ function emitAck(socket, event, payload, timeoutMs = 20000) {
     for (const [id, ts] of changed) enqueue(id, ts);
   }
 
-  let connectFails = 0;
+  let connectFails = 0, sweepTimer = null;
   socket.on('connect', async () => {
     connectFails = 0; // healthy connection resets the failure counter
     log('connected ' + socket.id);
@@ -267,6 +318,10 @@ function emitAck(socket, event, payload, timeoutMs = 20000) {
       await catchUp();
       if (ONCE) { log('--once done'); socket.disconnect(); process.exit(0); }
       log('LIVE — listening for AFFiNE-side edits (fires when the browser flushes its push)');
+      if (WRITE && SWEEP_MS > 0 && !sweepTimer) { // detect docs removed in AFFiNE -> move vault file to trash
+        sweepTimer = setInterval(() => deletionSweep(), SWEEP_MS); sweepTimer.unref?.();
+        setTimeout(() => deletionSweep(), 20000);
+      }
     } catch (e) { log('connect-setup err: ' + e.message); }
   });
 

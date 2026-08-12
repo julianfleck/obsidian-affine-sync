@@ -91,6 +91,46 @@ function planPatch(vaultText, oldRender, newRender, opts = {}) {
 }
 
 const isTableLine = (s) => /^\s*\|/.test(s);
+const isSeparatorRow = (s) => /^\s*\|(?:\s*:?-{3,}:?\s*\|)+\s*$/.test(s);
+
+// contiguous runs of table lines (>=2 lines: at least a header + separator)
+function findTables(lines) {
+  const tables = []; let i = 0;
+  while (i < lines.length) {
+    if (isTableLine(lines[i])) {
+      let j = i; while (j < lines.length && isTableLine(lines[j])) j++;
+      if (j - i >= 2) tables.push({ start: i, end: j - 1, lines: lines.slice(i, j) });
+      i = j;
+    } else i++;
+  }
+  return tables;
+}
+// rows of trimmed cells, ignoring the separator row — for content comparison
+function tableCells(tlines) {
+  return tlines.filter((l) => !isSeparatorRow(l))
+    .map((l) => l.trim().replace(/^\|/, '').replace(/\|$/, '').split('|').map((c) => c.trim()));
+}
+const tablesContentEqual = (a, b) => JSON.stringify(tableCells(a)) === JSON.stringify(tableCells(b));
+
+// whole-table reconciliation: positionally match vault tables to render tables;
+// where cell CONTENT differs (reorder / cell edit / row add-remove) swap the whole
+// vault table block for the render's. Content-compared, so pure formatting never
+// triggers a rewrite. Count mismatch (table added/removed) → conflict, skip.
+function reconcileTables(vaultLines, newRecLines) {
+  const vT = findTables(vaultLines), nT = findTables(newRecLines);
+  const applied = [], conflicts = [];
+  if (vT.length !== nT.length) {
+    if (vT.length || nT.length) conflicts.push({ kind: 'table', reason: 'table count differs (' + vT.length + ' vault / ' + nT.length + ' AFFiNE) — skipped' });
+    return { applied, conflicts };
+  }
+  for (let i = vT.length - 1; i >= 0; i--) { // bottom-up so earlier indices stay valid
+    if (!tablesContentEqual(vT[i].lines, nT[i].lines)) {
+      vaultLines.splice(vT[i].start, vT[i].end - vT[i].start + 1, ...nT[i].lines);
+      applied.push({ kind: 'table', at: vT[i].start, rows: tableCells(nT[i].lines).length });
+    }
+  }
+  return { applied, conflicts };
+}
 
 // CONVERGENCE: on a dirty signal, reconcile the two targets directly — diff the
 // vault file against the current (reconciled) AFFiNE render and apply every
@@ -107,10 +147,7 @@ function planConverge(vaultText, newRender, opts = {}) {
     const del = h.del.filter((s) => s.trim() !== '');
     const ins = h.ins.filter((s) => s.trim() !== '');
     if (del.length === 0 && ins.length === 0) continue;               // blank-only → formatting, ignore
-    if (del.some(isTableLine) || ins.some(isTableLine)) {             // structural guard
-      conflicts.push({ kind: 'table', reason: 'table/structural change — needs block handling (skipped)', del, ins });
-      continue;
-    }
+    if (del.some(isTableLine) || ins.some(isTableLine)) continue;     // tables handled in pass 2
     if (del.length > 0) {
       const starts = findRuns(vault, del);
       if (starts.length !== 1) { conflicts.push({ kind: 'replace', reason: starts.length === 0 ? 'not located (both sides changed?)' : starts.length + ' ambiguous matches', del, ins }); continue; }
@@ -124,7 +161,10 @@ function planConverge(vaultText, newRender, opts = {}) {
       applied.push({ kind: 'insert', at: anchors[0] + 1, ins });
     }
   }
+  // pass 2: whole-table reconciliation (content-aware block swap)
+  const t = reconcileTables(vault, newRec);
+  applied.push(...t.applied); conflicts.push(...t.conflicts);
   return { newText: vault.join('\n'), applied, conflicts };
 }
 
-module.exports = { planPatch, planConverge, diffLines, hunksFrom };
+module.exports = { planPatch, planConverge, reconcileTables, findTables, diffLines, hunksFrom };

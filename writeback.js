@@ -141,30 +141,27 @@ function reconcileTables(vaultLines, newRecLines) {
 function planConverge(vaultText, newRender, opts = {}) {
   const newRec = reconcile(newRender, opts).split('\n');
   const vault = vaultText.split('\n');
-  const hunks = hunksFrom(diffLines(vault, newRec));
-  const applied = [], conflicts = [];
-  for (const h of hunks) {
-    const del = h.del.filter((s) => s.trim() !== '');
-    const ins = h.ins.filter((s) => s.trim() !== '');
-    if (del.length === 0 && ins.length === 0) continue;               // blank-only → formatting, ignore
-    if (del.some(isTableLine) || ins.some(isTableLine)) continue;     // tables handled in pass 2
-    if (del.length > 0) {
-      const starts = findRuns(vault, del);
-      if (starts.length !== 1) { conflicts.push({ kind: 'replace', reason: starts.length === 0 ? 'not located (both sides changed?)' : starts.length + ' ambiguous matches', del, ins }); continue; }
-      vault.splice(starts[0], del.length, ...ins);
-      applied.push({ kind: ins.length ? 'replace' : 'delete', at: starts[0], del, ins });
-    } else {
-      if (h.before == null) { conflicts.push({ kind: 'insert', reason: 'no anchor context', ins }); continue; }
-      const anchors = findAnchors(vault, h.before);
-      if (anchors.length !== 1) { conflicts.push({ kind: 'insert', reason: anchors.length === 0 ? 'anchor not found' : 'anchor ambiguous', ins }); continue; }
-      vault.splice(anchors[0] + 1, 0, '', ...ins);
-      applied.push({ kind: 'insert', at: anchors[0] + 1, ins });
-    }
+  const vaultLines = vault; // alias for clarity
+  const ops = diffLines(vaultLines, newRec);
+  const out = [], applied = [], conflicts = [];
+  let k = 0, justApplied = false;
+  while (k < ops.length) {
+    if (ops[k].t === 'eq') { out.push(ops[k].s); k++; justApplied = false; continue; }
+    const del = [], ins = [];
+    while (k < ops.length && ops[k].t !== 'eq') { (ops[k].t === 'del' ? del : ins).push(ops[k].s); k++; }
+    const delNB = del.filter((s) => s.trim() !== ''), insNB = ins.filter((s) => s.trim() !== '');
+    if (delNB.length === 0 && insNB.length === 0) { out.push(...(justApplied ? ins : del)); justApplied = false; continue; } // blank-only: keep vault spacing, EXCEPT take render's blank right after an applied hunk (separator for inserted content)
+    if (delNB.some(isTableLine) || insNB.some(isTableLine)) { out.push(...del); justApplied = false; continue; }             // table: keep vault here; pass 2 swaps the whole block
+    if (delNB.length && insNB.length === 0) { out.push(...del); conflicts.push({ kind: 'delete', reason: 'AFFiNE removed content — skipped for review', del: delNB }); justApplied = false; continue; } // conservative: never auto-delete
+    out.push(...ins);                                                                                    // replace or insert: take AFFiNE content, positioned by the diff alignment
+    applied.push(delNB.length ? { kind: 'replace', del: delNB, ins: insNB } : { kind: 'insert', ins: insNB });
+    justApplied = true;
   }
   // pass 2: whole-table reconciliation (content-aware block swap)
-  const t = reconcileTables(vault, newRec);
+  const merged = out.join('\n').split('\n');
+  const t = reconcileTables(merged, newRec);
   applied.push(...t.applied); conflicts.push(...t.conflicts);
-  return { newText: vault.join('\n'), applied, conflicts };
+  return { newText: merged.join('\n'), applied, conflicts };
 }
 
 module.exports = { planPatch, planConverge, reconcileTables, findTables, diffLines, hunksFrom };

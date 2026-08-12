@@ -30,6 +30,7 @@ const fs = require('fs');
 const path = require('path');
 const crypto = require('crypto');
 const { planConverge } = require('./writeback.js'); // CJS: reconcile + convergence patch (vault ⇄ AFFiNE)
+const { reconcile } = require('./reconcile.js');    // full reconcile for brand-new docs
 
 const ENV = process['e' + 'nv'];
 const args = process.argv.slice(2);
@@ -42,6 +43,7 @@ const ONCE = args.includes('--once');
 const WRITE = args.includes('--write');           // opt-in: actually patch vault files on disk
 const DEBOUNCE = Number(g('--debounce', 4000));   // quiet period before a check
 const MAXWAIT = Number(g('--maxwait', 30000));    // cap: check at least this often during a continuous edit
+const NEWDOC_DIR = g('--new-doc-dir', '_affine-inbox'); // where AFFiNE-native new docs land (vault-relative)
 
 const BASE = (ENV.AFFINE_BASE_URL || '').replace(/\/$/, '');
 const WS = ENV.WS_ID;
@@ -103,6 +105,9 @@ function emitAck(socket, event, payload, timeoutMs = 20000) {
   const rev = buildReverseMap();
   const state = readJSON(STATE) || { lastSync: 0, docs: {} };
   state.docs = state.docs || {};
+  // created-in-AFFiNE docs record their vault path in the state; fold those into
+  // the reverse map so future edits converge to the created file (not re-create).
+  for (const [id, r] of Object.entries(state.docs)) if (r && r.rel && !rev[id]) rev[id] = r.rel;
   log('sidecar docs: ' + Object.keys(rev).length + ' | state lastSync=' + (state.lastSync ? new Date(state.lastSync).toISOString() : 'none') + ' | baselines=' + Object.keys(state.docs).length + ' | write-back=' + (WRITE ? 'ON (patches vault files)' : 'off (detect only)'));
 
   // load the vendored ESM converter (Y.Doc -> markdown); fall back to plain text
@@ -127,22 +132,48 @@ function emitAck(socket, event, payload, timeoutMs = 20000) {
   const isSystem = (docId) => docId === WS || docId.startsWith('db$');
   const pending = new Map(); // docId -> { timer, firstTs, ts }
 
-  // change-only write-back: locate the AFFiNE edit in the vault file and splice it in
-  function writeBack(docId, oldMd, newMd) {
-    const rel = rev[docId];
-    if (!rel) { log('    ↳ write skipped: no vault path for ' + docId + ' (AFFiNE-native doc)'); return; }
-    const vaultFile = path.join(VAULT, rel);
-    let vaultText; try { vaultText = fs.readFileSync(vaultFile, 'utf8'); } catch { log('    ↳ write skipped: vault file missing ' + rel); return; }
-    // convergence: diff the vault file directly against the current AFFiNE render
-    let res; try { res = planConverge(vaultText, newMd, { reverseMap: rev, wsId: WS, baseUrl: BASE }); } catch (e) { log('    ↳ planConverge err: ' + e.message); return; }
-    if (res.applied.length && res.newText !== vaultText) {
-      try { atomicWrite(vaultFile, res.newText); log('    ✎ WROTE ' + rel + '  (' + res.applied.length + ' hunk' + (res.applied.length > 1 ? 's' : '') + ' applied' + (res.conflicts.length ? ', ' + res.conflicts.length + ' conflict(s) skipped' : '') + ')'); }
-      catch (e) { log('    ↳ write err: ' + e.message); }
-    } else if (res.conflicts.length) {
-      log('    ⚠ write skipped ' + rel + ' — ' + res.conflicts.length + ' conflict(s): ' + res.conflicts.map((c) => c.reason).slice(0, 3).join('; '));
-    } else {
-      log('    ↳ nothing locatable to write for ' + rel);
+  const RESERVED_FS = /[\/\\:*?"<>|\x00-\x1f]/g;
+  const sanitizeName = (s) => (s || '').replace(RESERVED_FS, '-').replace(/\s+/g, ' ').trim().replace(/\.+$/, '').slice(0, 120);
+  const titleFromMd = (md) => { const m = md.match(/^#\s+(.+?)\s*$/m); return m ? m[1].trim() : ''; };
+
+  // create a vault file for an AFFiNE-native doc (not in the sidecar), then record
+  // the mapping so subsequent edits converge to it instead of re-creating.
+  function createNewDoc(docId, newMd, forcedRel) {
+    const md = reconcile(newMd, { reverseMap: rev, wsId: WS, baseUrl: BASE });
+    let rel = forcedRel;
+    if (!rel) {
+      const base = sanitizeName(titleFromMd(md)) || ('Untitled-' + docId);
+      rel = path.join(NEWDOC_DIR, base + '.md');
+      if (fs.existsSync(path.join(VAULT, rel))) rel = path.join(NEWDOC_DIR, base + '-' + docId + '.md'); // avoid clobbering an unrelated file
     }
+    const full = path.join(VAULT, rel);
+    try { fs.mkdirSync(path.dirname(full), { recursive: true }); atomicWrite(full, md.endsWith('\n') ? md : md + '\n'); }
+    catch (e) { log('    ↳ create err (' + rel + '): ' + e.message); return; }
+    rev[docId] = rel;
+    if (state.docs[docId]) state.docs[docId].rel = rel;
+    log('    ✎ CREATED ' + rel + '  (new AFFiNE-native doc, ' + md.split('\n').length + ' lines)');
+  }
+
+  // write-back: converge an existing vault file, or create one for a new AFFiNE doc
+  function writeBack(docId, newMd) {
+    const rel = rev[docId];
+    if (rel) {
+      const vaultFile = path.join(VAULT, rel);
+      if (fs.existsSync(vaultFile)) {
+        let vaultText; try { vaultText = fs.readFileSync(vaultFile, 'utf8'); } catch { log('    ↳ read err ' + rel); return; }
+        let res; try { res = planConverge(vaultText, newMd, { reverseMap: rev, wsId: WS, baseUrl: BASE }); } catch (e) { log('    ↳ planConverge err: ' + e.message); return; }
+        if (res.applied.length && res.newText !== vaultText) {
+          try { atomicWrite(vaultFile, res.newText); log('    ✎ WROTE ' + rel + '  (' + res.applied.length + ' hunk' + (res.applied.length > 1 ? 's' : '') + ' applied' + (res.conflicts.length ? ', ' + res.conflicts.length + ' conflict(s) skipped' : '') + ')'); }
+          catch (e) { log('    ↳ write err: ' + e.message); }
+        } else if (res.conflicts.length) {
+          log('    ⚠ ' + rel + ' — ' + res.conflicts.length + ' conflict(s) skipped: ' + res.conflicts.map((c) => c.reason).slice(0, 3).join('; '));
+        }
+        return;
+      }
+      createNewDoc(docId, newMd, rel); // mapped but file gone → recreate at the mapped path
+      return;
+    }
+    createNewDoc(docId, newMd); // brand-new AFFiNE doc
   }
 
   async function checkDoc(docId, ts) {
@@ -171,13 +202,13 @@ function emitAck(socket, event, payload, timeoutMs = 20000) {
         let oldMd = null; try { oldMd = fs.readFileSync(previewPath, 'utf8'); } catch {}
         try { fs.mkdirSync(PREVIEW, { recursive: true }); fs.writeFileSync(previewPath, markdown); } catch (e) { log('  preview write err: ' + e.message); }
         if (oldMd == null) {
-          log('  DIRTY  ' + relOf(docId) + '   (baseline captured: ' + markdown.length + ' chars / ' + markdown.split('\n').length + ' lines; diff shown on next edit)');
+          log('  DIRTY  ' + relOf(docId) + '   (' + markdown.split('\n').length + ' lines' + (rev[docId] ? '' : ' — new AFFiNE doc') + ')');
         } else {
           const df = lineDiff(oldMd, markdown);
           log('  DIRTY  ' + relOf(docId) + '   (−' + df.removed + '/+' + df.added + ' lines):');
           for (const l of df.preview) log(l);
-          if (WRITE) writeBack(docId, oldMd, markdown);
         }
+        if (WRITE) writeBack(docId, markdown); // create new doc or converge existing (idempotent if unchanged)
       }
       state.docs[docId] = { rel: rev[docId] || null, ts: newTs, hash: h };
       saveState(state);

@@ -217,7 +217,9 @@ function emitAck(socket, event, payload, timeoutMs = 20000) {
     for (const [id, ts] of changed) enqueue(id, ts);
   }
 
+  let connectFails = 0;
   socket.on('connect', async () => {
+    connectFails = 0; // healthy connection resets the failure counter
     log('connected ' + socket.id);
     try {
       const j = await emitAck(socket, 'space:join', { spaceType: 'workspace', spaceId: WS, clientVersion: CV });
@@ -237,7 +239,13 @@ function emitAck(socket, event, payload, timeoutMs = 20000) {
   });
 
   socket.on('disconnect', (r) => log('disconnected (' + r + ') — will reconnect'));
-  socket.on('connect_error', (e) => log('connect_error: ' + e.message));
+  socket.on('connect_error', (e) => {
+    connectFails++;
+    log('connect_error (' + connectFails + '): ' + e.message);
+    // sustained failure likely means an expired session cookie — exit so the
+    // supervisor restarts us with a fresh sign-in (cheap cookie refresh).
+    if (connectFails >= 15) { log('too many connect failures — exiting for supervised restart (fresh sign-in)'); saveState(state); process.exit(1); }
+  });
 
   process.on('SIGINT', () => { log('shutting down'); saveState(state); socket.disconnect(); process.exit(0); });
   process.on('SIGTERM', () => { saveState(state); socket.disconnect(); process.exit(0); });

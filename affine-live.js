@@ -155,8 +155,16 @@ function emitAck(socket, event, payload, timeoutMs = 20000) {
   }
 
   // write-back: converge an existing vault file, or create one for a new AFFiNE doc
+  // re-read the forward sidecar into the reverse map — a forward-sync (git→AFFiNE)
+  // may have just created/mapped a doc we're about to treat as "new".
+  function refreshRevFromSidecar() {
+    const sc = readJSON(SIDECAR);
+    if (sc && sc.docs) for (const [r, o] of Object.entries(sc.docs)) if (o && o.docId && rev[o.docId] !== r) rev[o.docId] = r;
+  }
+
   function writeBack(docId, newMd) {
-    const rel = rev[docId];
+    let rel = rev[docId];
+    if (!rel) { refreshRevFromSidecar(); rel = rev[docId]; } // maybe a forward-sync just mapped it
     if (rel) {
       const vaultFile = path.join(VAULT, rel);
       if (fs.existsSync(vaultFile)) {

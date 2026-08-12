@@ -17,11 +17,14 @@ const DRY = args.includes('--dry-run');
 const NOFOLDERS = args.includes('--no-folders');
 const excludeArgs=[]; for(let _i=0;_i<args.length;_i++){ if(args[_i]==='--exclude'&&args[_i+1]){ excludeArgs.push(args[_i+1]); _i++; } }
 const excludeContentArgs=[]; for(let _j=0;_j<args.length;_j++){ if(args[_j]==='--exclude-content'&&args[_j+1]){ excludeContentArgs.push(args[_j+1]); _j++; } }
+// --only <relpath> (repeatable): sync ONLY these files (name-map still built over the whole vault so links resolve). Used by the git-sync loop to push just the files that arrived from git, never AFFiNE-written ones.
+const onlyArgs=[]; for(let _k=0;_k<args.length;_k++){ if(args[_k]==='--only'&&args[_k+1]){ onlyArgs.push(args[_k+1].replace(/^\.?[\/]/,'')); _k++; } }
+const ONLY = onlyArgs.length ? new Set(onlyArgs) : null;
 const sIdx = args.indexOf('--sidecar');
 const SIDECAR = sIdx>=0 ? path.resolve(args[sIdx+1]) : (VAULT && path.join(VAULT,'.affine-sync.json'));
 const BASE = ENVV.AFFINE_BASE_URL;
 if (!BASE) { console.error('Set AFFINE_BASE_URL (e.g. https://affine.example.com)'); process.exit(2); }
-if (!WS || !VAULT) { console.error('usage: node affine-sync.js <workspaceId> <vaultDir> [--sidecar path] [--dry-run] [--no-folders] [--exclude glob] [--exclude-content substr]'); process.exit(2); }
+if (!WS || !VAULT) { console.error('usage: node affine-sync.js <workspaceId> <vaultDir> [--sidecar path] [--dry-run] [--no-folders] [--exclude glob] [--exclude-content substr] [--only relpath ...]'); process.exit(2); }
 if (!ENVV.AFFINE_EMAIL && !ENVV.AFFINE_API_TOKEN) { console.error('Set AFFINE_EMAIL + AFFINE_PASSWORD (or AFFINE_API_TOKEN)'); process.exit(2); }
 
 const proc = spawn('npx',['-y','-p','affine-mcp-server','affine-mcp'],{stdio:['pipe','pipe','inherit'],env:ENVV});
@@ -135,12 +138,13 @@ async function placeDoc(docId, leaf, rec){ await loadOrganize();
   const nameMap={}; let created=0, foldered=0, i0=0;
   for(const nt of notes){ i0++;
     let rec=sidecar.docs[nt.rel]; const isNew=!rec||!rec.docId; const h=sha(nt.raw);
-    if(isNew){ let docId=DRY?('DRY-'+sha(nt.rel)):null;
+    const targeted = !ONLY || ONLY.has(nt.rel);
+    if(isNew){ if(!targeted) continue; let docId=DRY?('DRY-'+sha(nt.rel)):null;
       if(!DRY){ try{ docId=JSON.parse(await call('create_doc_from_markdown',{workspaceId:WS,title:nt.title,markdown:bodyFor(nt),strict:false})).docId; }catch(e){ console.log('create FAILED '+nt.rel+': '+e.message); } }
       rec=sidecar.docs[nt.rel]={docId,title:nt.title,hash:null,tags:[],props:[]}; created++; }
     nt._new=isNew; nt.docId=rec.docId; if(!propSampleDoc) propSampleDoc=rec.docId;
     { const parts=nt.rel.replace(/\.md$/i,'').split(path.sep); for(let i=0;i<parts.length;i++) nameMap[parts.slice(i).join('/').toLowerCase()]=rec.docId; for(const k of [nt.title,nt.h1,...nt.aliases].filter(Boolean)) if(k) nameMap[k.toLowerCase()]=rec.docId; }
-    if(!DRY && rec.docId && rec.hash!==h){
+    if(targeted && !DRY && rec.docId && rec.hash!==h){
       await applyMeta(nt,rec,report);
       if(!NOFOLDERS){ const dir=path.dirname(nt.rel); if(dir!=='.'&&dir!==''){ if(!(rec.orgParent && sidecar.folders[dir]===rec.orgParent)){ const leaf=await ensureFolder(dir.split(path.sep),sidecar); if(leaf){ await placeDoc(rec.docId,leaf,rec); foldered++; } } } }
     }
@@ -150,6 +154,7 @@ async function placeDoc(docId, leaf, rec){ await loadOrganize();
   let updated=0, skipped=0, links=0; const unres={};
   for(const nt of notes){
     const rec=sidecar.docs[nt.rel]; if(!rec||!rec.docId) continue;
+    if(ONLY && !ONLY.has(nt.rel)) continue; // --only: don't push non-targeted docs
     const {out,n,un}=resolveLinks(nt.body,nameMap); links+=n; un.forEach(u=>unres[u]=(unres[u]||0)+1);
     const h=sha(nt.raw);
     if(rec.hash===h){ skipped++; continue; }
